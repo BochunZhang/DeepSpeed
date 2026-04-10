@@ -5,8 +5,8 @@
 # Full benchmark sweep for Qwen3-122B-A10B (MoE) on 4 GPUs.
 #
 # Runs (18 total):
-#   SuperOffload  × cpu_ratio {1.0, 0.9, 0.5, 0.0} × mbs {1, 2, 4}  = 12 runs
 #   ZeRO-Infinity × mbs {1, 2, 4}                                     =  3 runs
+#   SuperOffload  × cpu_ratio {1.0, 0.9, 0.5, 0.0} × mbs {1, 2, 4}  = 12 runs
 #   Pipeline Parallel × mbs {1, 2, 4}                                 =  3 runs
 #
 # Usage (from DeepSpeed-v0.18.9/):
@@ -19,6 +19,17 @@ echo "========================================================"
 echo "Qwen3-122B-A10B Full Benchmark Sweep"
 echo "========================================================"
 
+# ── ZeRO-Infinity: 3 mbs ─────────────────────────────────────────────────────
+for MBS in 1 2 4; do
+    GAS=$((256 / MBS / 4))
+    echo ""
+    echo "[SWEEP] zeroinfinity mbs=${MBS} gas=${GAS}"
+    bash "${SCRIPT_DIR}/finetune_qwen3-122b_4gpu.sh" zeroinfinity "${MBS}" 0 "${GAS}" || {
+        echo "[SWEEP] FAILED: zeroinfinity mbs=${MBS}"
+        continue
+    }
+done
+
 # ── SuperOffload: 4 cpu_ratio × 3 mbs ────────────────────────────────────────
 for CPU_RATIO in 1.0 0.9 0.5 0.0; do
     for MBS in 1 2 4; do
@@ -30,17 +41,6 @@ for CPU_RATIO in 1.0 0.9 0.5 0.0; do
             continue
         }
     done
-done
-
-# ── ZeRO-Infinity: 3 mbs ─────────────────────────────────────────────────────
-for MBS in 1 2 4; do
-    GAS=$((256 / MBS / 4))
-    echo ""
-    echo "[SWEEP] zeroinfinity mbs=${MBS} gas=${GAS}"
-    bash "${SCRIPT_DIR}/finetune_qwen3-122b_4gpu.sh" zeroinfinity "${MBS}" 0 "${GAS}" || {
-        echo "[SWEEP] FAILED: zeroinfinity mbs=${MBS}"
-        continue
-    }
 done
 
 # ── Pipeline Parallel: 3 mbs ──────────────────────────────────────────────────
