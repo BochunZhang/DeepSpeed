@@ -7,14 +7,19 @@ echo "================================================"
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 MODE=superoffload
-BATCH_SIZE=4
+BATCH_SIZE=8
+MBS=1
+GPUS_PER_NODE=4
 CPU_RATIO=0.90
 PROFILE=false
 
 usage() {
-    echo "Usage: $0 [--mode MODE] [--batch_size N] [--cpu_ratio R] [--profile]"
+    echo "Usage: $0 [--mode MODE] [--batch_size N] [--mbs N] [--cpu_ratio R] [--profile]"
     echo "  --mode       superoffload (default) | zerooffload | zeroinfinity"
-    echo "  --batch_size micro-batch size per GPU (default: 4)"
+    echo "  --batch_size train batch size across all GPUs (default: 8)"
+    echo "  --mbs        train micro batch size per GPU (default: 1)"
+    echo "               gradient_accumulation_steps is derived as:"
+    echo "               batch_size / (mbs * num_gpus)"
     echo "  --cpu_ratio  CPU offload ratio for superoffload (default: 0.90)"
     echo "  --profile    enable nsys profiling (default: off)"
     exit 1
@@ -24,6 +29,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --mode)       MODE="$2";       shift 2 ;;
         --batch_size) BATCH_SIZE="$2"; shift 2 ;;
+        --mbs)        MBS="$2";        shift 2 ;;
         --cpu_ratio)  CPU_RATIO="$2";  shift 2 ;;
         --profile)    PROFILE=true;    shift   ;;
         --help|-h)    usage ;;
@@ -31,16 +37,30 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ── Derive gradient accumulation steps ────────────────────────────────────────
+# Per DeepSpeed: train_batch_size = mbs * gas * dp_size
+DP_SIZE=${GPUS_PER_NODE}
+GAS_DENOM=$(( MBS * DP_SIZE ))
+if (( GAS_DENOM == 0 )) || (( BATCH_SIZE % GAS_DENOM != 0 )); then
+    echo "Error: batch_size (${BATCH_SIZE}) must be divisible by mbs (${MBS}) * num_gpus (${DP_SIZE}) = ${GAS_DENOM}"
+    exit 1
+fi
+GAS=$(( BATCH_SIZE / GAS_DENOM ))
+if (( GAS < 1 )); then
+    echo "Error: derived gradient_accumulation_steps (${GAS}) must be >= 1"
+    exit 1
+fi
+
 # ── Validate mode ─────────────────────────────────────────────────────────────
 if [ "$MODE" = "superoffload" ]; then
     MODE_LABEL="super-offload"
-    CONFIG_LABEL="mbs${BATCH_SIZE}-cpu${CPU_RATIO}"
+    CONFIG_LABEL="bs${BATCH_SIZE}-mbs${MBS}-cpu${CPU_RATIO}"
 elif [ "$MODE" = "zerooffload" ]; then
     MODE_LABEL="zero-offload"
-    CONFIG_LABEL="mbs${BATCH_SIZE}"
+    CONFIG_LABEL="bs${BATCH_SIZE}-mbs${MBS}"
 elif [ "$MODE" = "zeroinfinity" ]; then
     MODE_LABEL="zero-infinity"
-    CONFIG_LABEL="mbs${BATCH_SIZE}"
+    CONFIG_LABEL="bs${BATCH_SIZE}-mbs${MBS}"
 else
     echo "Error: Unknown mode '$MODE'. Use: superoffload | zerooffload | zeroinfinity"
     exit 1
@@ -100,7 +120,8 @@ if [ "$MODE" = "superoffload" ]; then
 cat > "${DS_CONFIG_JSON}" << EOF
 {
     "train_batch_size": ${BATCH_SIZE},
-    "gradient_accumulation_steps": 1,
+    "train_micro_batch_size_per_gpu": ${MBS},
+    "gradient_accumulation_steps": ${GAS},
     "bf16": { "enabled": true },
     "zero_optimization": {
         "stage": 3,
@@ -123,7 +144,8 @@ elif [ "$MODE" = "zerooffload" ]; then
 cat > "${DS_CONFIG_JSON}" << EOF
 {
     "train_batch_size": ${BATCH_SIZE},
-    "gradient_accumulation_steps": 1,
+    "train_micro_batch_size_per_gpu": ${MBS},
+    "gradient_accumulation_steps": ${GAS},
     "bf16": { "enabled": true },
     "zero_optimization": {
         "stage": 3,
@@ -143,7 +165,8 @@ elif [ "$MODE" = "zeroinfinity" ]; then
 cat > "${DS_CONFIG_JSON}" << EOF
 {
     "train_batch_size": ${BATCH_SIZE},
-    "gradient_accumulation_steps": 1,
+    "train_micro_batch_size_per_gpu": ${MBS},
+    "gradient_accumulation_steps": ${GAS},
     "bf16": { "enabled": true },
     "zero_optimization": {
         "stage": 3,
@@ -186,9 +209,7 @@ if [ "$PROFILE" = "true" ]; then
     PROFILE_FLAG="--profile --profile_start ${PROFILE_START} --profile_end ${PROFILE_END}"
 fi
 
-GPUS_PER_NODE=4
-
-echo "Qwen3-14B | mode=${MODE} batch_size=${BATCH_SIZE} cpu_ratio=${CPU_RATIO} profile=${PROFILE}"
+echo "Qwen3-14B | mode=${MODE} batch_size=${BATCH_SIZE} mbs=${MBS} gas=${GAS} (derived) cpu_ratio=${CPU_RATIO} profile=${PROFILE}"
 echo "Output: ${OUTPUT_DIR}"
 echo "================================================"
 

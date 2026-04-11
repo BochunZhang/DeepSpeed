@@ -24,7 +24,6 @@ from transformers import (
 )
 from deepspeed import comm as dist
 
-import ctypes
 import json
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -33,22 +32,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Active only when the script is launched with:
 #   nsys profile --capture-range=cudaProfilerApi ...
 # and --profile is passed to this script.
-try:
-    _libcudart = ctypes.CDLL("libcudart.so")
-    _NSYS_AVAILABLE = True
-except OSError:
-    _libcudart = None
-    _NSYS_AVAILABLE = False
-
-
 def nsys_start():
-    if _NSYS_AVAILABLE:
-        _libcudart.cudaProfilerStart()
+    if torch.cuda.is_available():  #ignore-cuda
+        torch.cuda.cudart().cudaProfilerStart()  #ignore-cuda
 
 
 def nsys_stop():
-    if _NSYS_AVAILABLE:
-        _libcudart.cudaProfilerStop()
+    if torch.cuda.is_available():  #ignore-cuda
+        torch.cuda.cudart().cudaProfilerStop()  #ignore-cuda
 
 
 def setup_logger(rank: int = 0, log_level: str = "INFO") -> logging.Logger:
