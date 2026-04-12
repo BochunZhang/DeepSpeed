@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 #
-# Full benchmark sweep for Qwen2.5-72B-Instruct on 4 GPUs.
+# Full benchmark sweep for Qwen3-235B-A22B-Instruct-2507 (MoE) on 4 GPUs.
 #
 # Modes tested:
 #   superoffload           (optimizer → CPU, super_offload=true)
@@ -15,15 +15,15 @@
 # Combinations: 4 modes × 2 GBS × 4 MBS = 32 runs
 #
 # Usage (from DeepSpeed-v0.18.9/):
-#   bash tests/cpu_offload/run_qwen2.5-72b.sh
+#   bash tests/cpu_offload/run_qwen3-235b-a22b.sh
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-FINETUNE="${SCRIPT_DIR}/finetune_qwen2.5-72b_4gpu.sh"
-CPU_RATIO=0.90
+FINETUNE="${SCRIPT_DIR}/finetune_qwen3-235b-a22b_4gpu.sh"
+CPU_RATIO=0.90   # used by superoffload and zeroinfinity-superoffload
 
 echo "========================================================"
-echo "Qwen2.5-72B-Instruct Full Benchmark Sweep (32 runs)"
+echo "Qwen3-235B-A22B-Instruct-2507 Full Benchmark Sweep (32 runs)"
 echo "========================================================"
 
 run() {
@@ -33,6 +33,7 @@ run() {
     bash "${FINETUNE}" --mode "${mode}" --gbs "${gbs}" --mbs "${mbs}" \
         --cpu_ratio "${CPU_RATIO}" || {
         echo "[SWEEP] FAILED: mode=${mode} gbs=${gbs} mbs=${mbs}"
+        # continue sweep even on failure
     }
 }
 
