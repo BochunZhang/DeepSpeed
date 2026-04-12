@@ -5,23 +5,58 @@
 # Pipeline-Parallel fine-tuning benchmark for Qwen3-14B on 4 GPUs (no CPU offload).
 #
 # Usage:
-#   bash finetune_qwen3-14b_4gpu_pp.sh <mbs> [global_batch_size]
-#
-#   mbs              : micro-batch size per pipeline stage (e.g. 1 2 4)
-#   global_batch_size: default 256; micro_batches = gbs / mbs
+#   bash finetune_qwen3-14b_4gpu_pp.sh [--batch_size N] [--mbs N] [--profile]
 set -eo pipefail
 
+echo "========================================================"
+echo "Qwen3-14B Fine-tuning with DeepSpeed PP on 4 GPU"
+echo "========================================================"
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+BATCH_SIZE=256
+MBS=1
+GPUS_PER_NODE=4
+PP_STAGES=4
+PROFILE=false
+
+usage() {
+    echo "Usage: $0 [--batch_size N] [--mbs N] [--profile]"
+    echo "  --batch_size  global train batch size (default: 256)"
+    echo "  --mbs         micro-batch size per pipeline stage (default: 1)"
+    echo "                micro_batches (gas) is derived as: batch_size / mbs"
+    echo "  --profile     enable nsys profiling (default: off)"
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --batch_size) BATCH_SIZE="$2"; shift 2 ;;
+        --mbs)        MBS="$2";        shift 2 ;;
+        --profile)    PROFILE=true;    shift   ;;
+        --help|-h)    usage ;;
+        *) echo "Unknown argument: $1"; usage ;;
+    esac
+done
+
+# ── Derive micro_batches (gas) ────────────────────────────────────────────────
+# PP: train_batch() processes micro_batches micro-batches per step.
+# global batch_size = mbs * micro_batches
+if (( MBS == 0 )) || (( BATCH_SIZE % MBS != 0 )); then
+    echo "Error: batch_size (${BATCH_SIZE}) must be divisible by mbs (${MBS})"
+    exit 1
+fi
+MICRO_BATCHES=$(( BATCH_SIZE / MBS ))
+if (( MICRO_BATCHES < 1 )); then
+    echo "Error: derived micro_batches (${MICRO_BATCHES}) must be >= 1"
+    exit 1
+fi
+
+# ── MODELS_PATH & auto-download ──────────────────────────────────────────────
 if [ -z "${MODELS_PATH}" ]; then
     echo "Error: MODELS_PATH environment variable is not set."
     echo "  export MODELS_PATH=/path/to/your/model/cache"
     exit 1
 fi
-
-MBS=${1:?"Usage: $0 <mbs> [global_batch_size]"}
-GBS=${2:-256}
-GPUS=4
-PP_STAGES=4
-MICRO_BATCHES=$((GBS / MBS))   # total micro-batches across the pipeline
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DS_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -30,7 +65,6 @@ MODEL_REPO="Qwen/Qwen3-14B"
 MODEL_NAME="${MODELS_PATH}/${MODEL_REPO}"
 MODEL_SHORT="qwen3-14b"
 
-# Download the model into MODELS_PATH if it is not already present.
 if [ ! -d "${MODEL_NAME}" ] || [ -z "$(ls -A "${MODEL_NAME}" 2>/dev/null)" ]; then
     echo "[INFO] ${MODEL_NAME} not found, downloading ${MODEL_REPO}..."
     mkdir -p "${MODEL_NAME}"
@@ -45,18 +79,32 @@ if [ ! -d "${MODEL_NAME}" ] || [ -z "$(ls -A "${MODEL_NAME}" 2>/dev/null)" ]; th
     fi
 fi
 
-CONFIG_LABEL="pp-mbs${MBS}-gbs${GBS}"
+# ── Paths & tags ─────────────────────────────────────────────────────────────
+CONFIG_LABEL="pp-bs${BATCH_SIZE}-mbs${MBS}"
 RUN_TAG="${MODEL_SHORT}_pp_${CONFIG_LABEL}"
 RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${DS_ROOT}/results/cpu_offload/${MODEL_SHORT}/pp/${CONFIG_LABEL}_${RUN_TIMESTAMP}"
 
 mkdir -p "${OUTPUT_DIR}"
 
-echo "========================================================"
-echo "Qwen3-14B PP | mbs=${MBS} gbs=${GBS} micro_batches=${MICRO_BATCHES}"
-echo "Output: ${OUTPUT_DIR}"
-echo "========================================================"
+# ── Script argument parameters ────────────────────────────────────────────────
+ACTIVATION_CHECKPOINTING=true
+MAX_LENGTH=4096
+LOG_INTERVAL=1
+DATASET_NAME="tatsu-lab/alpaca"
+DATASET_PERCENTAGE=10.0
+BENCH_STEPS=12
+WARMUP_STEPS=4
+LR=1e-5
+WEIGHT_DECAY=0.01
+SEED=42
 
+ACTIVATION_CHECKPOINTING_FLAG=""
+if [ "$ACTIVATION_CHECKPOINTING" = "true" ]; then
+    ACTIVATION_CHECKPOINTING_FLAG="--activation_checkpointing"
+fi
+
+# ── numarun ──────────────────────────────────────────────────────────────────
 if command -v numarun &>/dev/null; then
     NUMARUN="numarun"
     echo "[INFO] numarun found: enabling per-rank CPU affinity"
@@ -65,25 +113,48 @@ else
     echo "[INFO] numarun not found: skipping CPU affinity binding"
 fi
 
+# ── nsys profiling ───────────────────────────────────────────────────────────
+PROFILE_START=$((WARMUP_STEPS + BENCH_STEPS - 3))
+PROFILE_END=$((WARMUP_STEPS + BENCH_STEPS - 1))
 NSYS_OUT="${OUTPUT_DIR}/${RUN_TAG}_profile"
-CMD="${NUMARUN} deepspeed --num_gpus=${GPUS} ${SCRIPT_DIR}/finetune_pp.py \
+
+PROFILE_FLAG=""
+if [ "$PROFILE" = "true" ]; then
+    PROFILE_FLAG="--profile --profile_start ${PROFILE_START} --profile_end ${PROFILE_END}"
+fi
+
+echo "Qwen3-14B PP | batch_size=${BATCH_SIZE} mbs=${MBS} micro_batches=${MICRO_BATCHES} (derived) profile=${PROFILE}"
+echo "Output: ${OUTPUT_DIR}"
+echo "========================================================"
+
+DEEPSPEED_CMD="${NUMARUN} deepspeed --num_gpus=${GPUS_PER_NODE} ${SCRIPT_DIR}/finetune_pp.py \
     --model_name ${MODEL_NAME} \
-    --lr 1e-5 \
-    --batch_size ${MBS} \
+    --lr ${LR} \
+    --batch_size ${BATCH_SIZE} \
     --micro_batch_size ${MBS} \
     --micro_batches ${MICRO_BATCHES} \
     --pp_stages ${PP_STAGES} \
-    --gpus_per_node ${GPUS} \
+    --gpus_per_node ${GPUS_PER_NODE} \
     --output_dir ${OUTPUT_DIR} \
     --run_tag ${RUN_TAG} \
-    --max_length 4096 \
-    --weight_decay 0.01 \
-    --seed 42 \
-    --log_interval 1 \
-    --dataset_name tatsu-lab/alpaca \
-    --dataset_percentage 10.0 \
-    --warmup_steps 4 \
-    --bench_steps 12 \
-    --activation_checkpointing"
+    --max_length ${MAX_LENGTH} \
+    --weight_decay ${WEIGHT_DECAY} \
+    --seed ${SEED} \
+    --log_interval ${LOG_INTERVAL} \
+    --dataset_name ${DATASET_NAME} \
+    --dataset_percentage ${DATASET_PERCENTAGE} \
+    --warmup_steps ${WARMUP_STEPS} \
+    --bench_steps ${BENCH_STEPS} \
+    ${ACTIVATION_CHECKPOINTING_FLAG} \
+    ${PROFILE_FLAG}"
 
-eval ${CMD}
+if [ "$PROFILE" = "true" ]; then
+    nsys profile \
+        --capture-range=cudaProfilerApi \
+        --capture-range-end=stop \
+        --force-overwrite=true \
+        -o "${NSYS_OUT}" \
+        ${DEEPSPEED_CMD}
+else
+    eval ${DEEPSPEED_CMD}
+fi
