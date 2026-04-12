@@ -15,7 +15,7 @@ PROFILE=false
 
 usage() {
     echo "Usage: $0 [--mode MODE] [--gbs N] [--mbs N] [--cpu_ratio R] [--profile]"
-    echo "  --mode       superoffload (default) | zerooffload | zeroinfinity-zerooffload | zeroinfinity-superoffload"
+    echo "  --mode       superoffload (default) | zerooffload | zeroinfinity | zeroinfinity-superoffload"
     echo "  --gbs train batch size across all GPUs (default: 8)"
     echo "  --mbs        train micro batch size per GPU (default: 1)"
     echo "               gradient_accumulation_steps is derived as:"
@@ -58,14 +58,14 @@ if [ "$MODE" = "superoffload" ]; then
 elif [ "$MODE" = "zerooffload" ]; then
     MODE_LABEL="zero-offload"
     CONFIG_LABEL="bs${GBS}-mbs${MBS}"
-elif [ "$MODE" = "zeroinfinity-zerooffload" ]; then
-    MODE_LABEL="zeroinfinity-zerooffload"
+elif [ "$MODE" = "zeroinfinity" ]; then
+    MODE_LABEL="zeroinfinity"
     CONFIG_LABEL="bs${GBS}-mbs${MBS}"
 elif [ "$MODE" = "zeroinfinity-superoffload" ]; then
     MODE_LABEL="zeroinfinity-superoffload"
     CONFIG_LABEL="bs${GBS}-mbs${MBS}-cpu${CPU_RATIO}"
 else
-    echo "Error: Unknown mode '$MODE'. Use: superoffload | zerooffload | zeroinfinity-zerooffload | zeroinfinity-superoffload"
+    echo "Error: Unknown mode '$MODE'. Use: superoffload | zerooffload | zeroinfinity | zeroinfinity-superoffload"
     exit 1
 fi
 
@@ -195,7 +195,7 @@ cat > "${DS_CONFIG_JSON}" << EOF
 }
 EOF
 
-elif [ "$MODE" = "zeroinfinity-zerooffload" ]; then
+elif [ "$MODE" = "zeroinfinity" ]; then
 cat > "${DS_CONFIG_JSON}" << EOF
 {
     "train_batch_size": ${GBS},

@@ -476,7 +476,7 @@ def main(args: argparse.Namespace) -> None:
 
         mode_label = "zero3"
         if args.deepspeed_config:
-            for candidate in ("superoffload", "zerooffload", "zeroinfinity-superoffload", "zeroinfinity-zerooffload"):
+            for candidate in ("superoffload", "zerooffload", "zeroinfinity-superoffload", "zeroinfinity"):
                 if candidate in args.deepspeed_config:
                     mode_label = candidate
                     break
