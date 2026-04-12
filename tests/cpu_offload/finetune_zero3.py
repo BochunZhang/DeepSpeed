@@ -14,7 +14,7 @@ import torch
 import deepspeed
 import wandb
 from datasets import load_dataset
-from torch.utils.data import DataLoader
+from deepspeed.utils import RepeatingLoader
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -236,7 +236,7 @@ def load_and_preprocess_dataset(
     tokenizer: AutoTokenizer,
     max_length: int,
     logger: logging.Logger
-) -> Tuple[Any, DataLoader]:
+) -> Any:
     logger.debug(f"Loading dataset: {dataset_name}")
 
     dataset = load_dataset(dataset_name)
@@ -257,14 +257,7 @@ def load_and_preprocess_dataset(
         desc="Tokenizing"
     )
 
-    train_dataloader = DataLoader(
-        tokenized_dataset,
-        batch_size=1,
-        collate_fn=default_data_collator,
-        shuffle=True
-    )
-
-    return tokenized_dataset, train_dataloader
+    return tokenized_dataset
 
 
 def initialize_wandb(args: argparse.Namespace, exp_name: str, logger: logging.Logger) -> None:
@@ -307,7 +300,7 @@ def main(args: argparse.Namespace) -> None:
     setup_model_training(model, args.activation_checkpointing, logger)
     optimizer = create_optimizer(model)
 
-    tokenized_dataset, train_dataloader = load_and_preprocess_dataset(
+    tokenized_dataset = load_and_preprocess_dataset(
         args.dataset_name, args.dataset_percentage, tokenizer, args.max_length, logger
     )
 
@@ -333,146 +326,130 @@ def main(args: argparse.Namespace) -> None:
     logger.debug(f"Model type: {'MoE' if is_moe_model else 'Dense'}")
     logger.debug(f"Model size: {model_size:,} parameters")
 
-    # Calculate TFLOPS only for non-MoE models
-    total_tflops = None
+    # Calculate per-sample TFLOPS only for non-MoE models
+    per_sample_tflops = None
     if not is_moe_model:
-        total_tflops = estimate_transformer_tflops(
+        per_sample_tflops = estimate_transformer_tflops(
             sequence_length, model_size, model.config.num_hidden_layers,
             model.config.hidden_size, args.activation_checkpointing
         )
 
-    global_step = 0
-    total_tokens_processed = 0
-    total_train_time = 0
-    iter_times = []
-    losses = []
-    # Per-bench-step records (warmup steps excluded), written to results.json.
-    step_records = []
+    gas = model_engine.gradient_accumulation_steps()
+    mbs = model_engine.train_micro_batch_size_per_gpu()
+    total_iters = args.num_iters
 
-    # Full per-iteration training log (includes warmup steps). Written only on
-    # rank 0, streamed as JSON Lines during training and converted to a single
-    # JSON array when the training loop exits (normally or via exception).
+    logger.debug(f"gas={gas}, mbs={mbs}, total_iters={total_iters}")
+
+    iter_times = []
+    iter_records = []
+
     training_log_writer: Optional[TrainingLogWriter] = None
     if dist.get_rank() == 0:
         training_log_writer = TrainingLogWriter(args.output_dir, run_tag=args.run_tag)
 
+    # Wrap dataloader so it never exhausts (dataset may be smaller than
+    # total micro-steps = num_iters * gas).
+    data_iter = iter(RepeatingLoader(train_dataloader))
+
     try:
-        stop = False
-        for epoch in range(args.num_train_epochs):
-            logger.debug(f"Starting epoch {epoch + 1}/{args.num_train_epochs}")
+        for iteration in range(total_iters):
+            # nsys: profile_start / profile_end are 1-based iteration numbers.
+            if args.profile and (iteration + 1) == args.profile_start:
+                nsys_start()
 
-            for step, batch in enumerate(train_dataloader):
-                # nsys capture range: start at profile_start, stop after profile_end.
-                # Activated only when --profile is passed.
-                if args.profile and global_step == args.profile_start:
-                    nsys_start()
+            iter_start_time = time.time()
+            iter_loss_sum = 0.0
 
-                step_start_time = time.time()
+            # ── One iteration = gas micro-steps + 1 optimizer step ────────
+            for micro_step in range(gas):
+                batch = next(data_iter)
                 batch = {k: v.to(model_engine.device) for k, v in batch.items()}
 
-                actual_batch_size = batch['input_ids'].shape[0]
-                tokens_in_batch = actual_batch_size * sequence_length
+                is_last = (micro_step == gas - 1)
+                model_engine.set_gradient_accumulation_boundary(is_last)
 
                 outputs = model_engine(**batch)
                 loss = outputs.loss
-
                 model_engine.backward(loss)
 
-                model_engine.step()
+                if is_last:
+                    model_engine.step()
 
-                step_time = time.time() - step_start_time
-                global_step += 1
+                iter_loss_sum += loss.item()
 
-                if global_step > args.warmup_steps:
-                    iter_times.append(step_time)
+            iter_time = time.time() - iter_start_time
+            avg_loss = iter_loss_sum / gas
 
-                losses.append(loss.item())
+            iter_times.append(iter_time)
 
-                total_tokens_processed += tokens_in_batch
-                total_train_time += step_time
+            # ── Per-iteration metrics (per GPU) ──────────────────────────
+            tokens_in_iter = mbs * gas * sequence_length
+            tokens_per_second = tokens_in_iter / iter_time
+            iter_tflops = None
+            if per_sample_tflops is not None:
+                iter_tflops = mbs * gas * per_sample_tflops / iter_time
 
-                tokens_per_second = tokens_in_batch / step_time
-                step_tflops = None
+            # ── Console log ──────────────────────────────────────────────
+            if (iteration + 1) % args.log_interval == 0:
+                if is_moe_model:
+                    log_msg = (f"Iter {iteration+1:4d} | "
+                              f"Loss: {avg_loss:.4f} | "
+                              f"Time: {iter_time * MS_PER_SECOND:5.0f}ms")
+                else:
+                    log_msg = (f"Iter {iteration+1:4d} | "
+                              f"Loss: {avg_loss:.4f} | "
+                              f"Time: {iter_time * MS_PER_SECOND:5.0f}ms | "
+                              f"TFLOPS/GPU: {iter_tflops:5.2f} | "
+                              f"Tokens/s: {tokens_per_second:6.0f}")
+                logger.info(log_msg)
 
-                if not is_moe_model and total_tflops is not None:
-                    step_tflops = args.gbs * total_tflops / step_time / dist.get_world_size()
-
-                if global_step % args.log_interval == 0:
-                    avg_loss = sum(losses[-args.log_interval:]) / len(losses[-args.log_interval:])
-
-                    if is_moe_model:
-                        # Skip throughput metrics for MoE models
-                        log_msg = (f"Step {global_step:4d} | "
-                                  f"Loss: {avg_loss:.4f} | "
-                                  f"Time: {step_time * MS_PER_SECOND:5.0f}ms")
-                    else:
-                        log_msg = (f"Step {global_step:4d} | "
-                                  f"Loss: {avg_loss:.4f} | "
-                                  f"Time: {step_time * MS_PER_SECOND:5.0f}ms | "
-                                  f"TFLOPS/GPU: {step_tflops:5.2f} | "
-                                  f"Tokens/s: {tokens_per_second:6.0f}")
-
-                    logger.info(log_msg)
-
-                    if args.use_wandb and dist.get_rank() == 0:
-                        log_dict = {
-                            "train/loss": avg_loss,
-                            "train/epoch": epoch + 1,
-                            "train/global_step": global_step,
-                            "train/learning_rate": args.lr,
-                            "perf/step_time_ms": step_time * MS_PER_SECOND,
-                            "perf/tokens_per_second": tokens_per_second,
-                        }
-
-                        if not is_moe_model and step_tflops is not None:
-                            log_dict["perf/tflops_per_gpu"] = step_tflops
-
-                        wandb.log(log_dict, step=global_step)
-
-                # Accumulate per-step record for JSON output (bench steps only).
-                if global_step > args.warmup_steps:
-                    record = {
-                        "step": global_step,
-                        "loss": round(loss.item(), 6),
-                        "iter_time_ms": round(step_time * MS_PER_SECOND, 1),
-                        "tokens_per_second": round(tokens_per_second, 1),
+                if args.use_wandb and dist.get_rank() == 0:
+                    log_dict = {
+                        "train/loss": avg_loss,
+                        "train/iteration": iteration + 1,
+                        "train/learning_rate": args.lr,
+                        "perf/iter_time_ms": iter_time * MS_PER_SECOND,
+                        "perf/tokens_per_second": tokens_per_second,
                     }
-                    if step_tflops is not None:
-                        record["tflops_per_gpu"] = round(step_tflops, 4)
-                    step_records.append(record)
+                    if iter_tflops is not None:
+                        log_dict["perf/tflops_per_gpu"] = iter_tflops
+                    wandb.log(log_dict, step=iteration + 1)
 
-                # Full per-iteration training log (includes warmup steps).
-                if training_log_writer is not None:
-                    iter_record = {
-                        "global_step": global_step,
-                        "epoch": epoch + 1,
-                        "loss": round(loss.item(), 6),
-                        "step_time_ms": round(step_time * MS_PER_SECOND, 1),
-                        "tokens_per_second": (
-                            round(tokens_per_second, 1) if not is_moe_model else None
-                        ),
-                        "learning_rate": args.lr,
-                        "tflops_per_gpu": (
-                            round(step_tflops, 4) if step_tflops is not None else None
-                        ),
-                    }
-                    training_log_writer.append(iter_record)
+            # ── Per-iteration record for results JSON ────────────────────
+            record = {
+                "iteration": iteration + 1,
+                "loss": round(avg_loss, 6),
+                "iter_time_ms": round(iter_time * MS_PER_SECOND, 1),
+                "tokens_per_second": round(tokens_per_second, 1),
+            }
+            if iter_tflops is not None:
+                record["tflops_per_gpu"] = round(iter_tflops, 4)
+            iter_records.append(record)
 
-                # nsys capture range: stop after profile_end step.
-                if args.profile and global_step == args.profile_end:
-                    nsys_stop()
+            # ── Per-iteration training log (JSONL) ───────────────────────
+            if training_log_writer is not None:
+                log_record = {
+                    "iteration": iteration + 1,
+                    "loss": round(avg_loss, 6),
+                    "iter_time_ms": round(iter_time * MS_PER_SECOND, 1),
+                    "tokens_per_second": (
+                        round(tokens_per_second, 1) if not is_moe_model else None
+                    ),
+                    "learning_rate": args.lr,
+                    "tflops_per_gpu": (
+                        round(iter_tflops, 4) if iter_tflops is not None else None
+                    ),
+                }
+                training_log_writer.append(log_record)
 
-                stop = global_step >= args.bench_steps
-                if stop:
-                    break
+            # nsys: stop after profile_end iteration.
+            if args.profile and (iteration + 1) == args.profile_end:
+                nsys_stop()
 
-            if stop:
-                break
     finally:
         if training_log_writer is not None:
             training_log_writer.close_and_convert()
             logger.info(f"Training log saved to {training_log_writer.json_path}")
-
 
     if args.save_checkpoint and dist.get_rank() == 0:
         try:
@@ -491,37 +468,37 @@ def main(args: argparse.Namespace) -> None:
         except Exception as e:
             logger.error(f"Error finishing WandB run: {e}")
 
-    # Save benchmark results as JSON (rank 0 only, bench steps only).
+    # ── Save benchmark results as JSON (rank 0 only) ─────────────────────
     if dist.get_rank() == 0 and iter_times:
         avg_time = sum(iter_times) / len(iter_times)
-        avg_tokens_per_s = args.gbs * sequence_length / avg_time
+        tokens_in_iter = mbs * gas * sequence_length
+        avg_tokens_per_s = tokens_in_iter / avg_time
 
-        # Infer mode label from the deepspeed config filename
         mode_label = "zero3"
         if args.deepspeed_config:
-            for candidate in ("superoffload", "zerooffload", "zeroinfinity"):
+            for candidate in ("superoffload", "zerooffload", "zeroinfinity", "superinfinity"):
                 if candidate in args.deepspeed_config:
                     mode_label = candidate
                     break
 
         avg_tflops = None
-        if not is_moe_model and total_tflops is not None:
-            avg_tflops = round(args.gbs * total_tflops / avg_time / dist.get_world_size(), 4)
+        if per_sample_tflops is not None:
+            avg_tflops = round(mbs * gas * per_sample_tflops / avg_time, 4)
 
         results = {
             "mode": mode_label,
             "model": args.model_name,
             "gbs": args.gbs,
+            "mbs": mbs,
+            "gas": gas,
             "seq_len": sequence_length,
             "gpus": dist.get_world_size(),
             "activation_checkpointing": args.activation_checkpointing,
-            "warmup_steps": args.warmup_steps,
-            "bench_steps": args.bench_steps,
+            "num_iters": total_iters,
             "avg_iter_time_ms": round(avg_time * MS_PER_SECOND, 1),
             "avg_tokens_per_second": round(avg_tokens_per_s, 1),
             "avg_tflops_per_gpu": avg_tflops,
-            # One entry per bench step (warmup excluded), length = bench_steps - warmup_steps.
-            "steps": step_records,
+            "iterations": iter_records,
         }
 
         os.makedirs(args.output_dir, exist_ok=True)
@@ -582,10 +559,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log_level", type=str, default="INFO",
                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                        help="Logging level for controlling output verbosity")
-    parser.add_argument("--warmup_steps", type=int, default=15,
-                       help="Number of warmup steps for performance measurements")
-    parser.add_argument("--bench_steps", type=int, default=100,
-                       help="Number of benchmark steps to run")
+    parser.add_argument("--num_iters", type=int, default=10,
+                       help="Number of training iterations to run. "
+                            "Each iteration = gas micro-steps + 1 optimizer step.")
 
     parser.add_argument("--save_checkpoint", action="store_true",
                        help="Save model checkpoint after training")
@@ -607,9 +583,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", action="store_true",
                        help="Enable nsys profiling via cudaProfilerApi range capture")
     parser.add_argument("--profile_start", type=int, default=0,
-                       help="Global step at which to call cudaProfilerStart (inclusive)")
+                       help="Iteration number (1-based) at which to call cudaProfilerStart")
     parser.add_argument("--profile_end", type=int, default=0,
-                       help="Global step at which to call cudaProfilerStop (inclusive)")
+                       help="Iteration number (1-based) at which to call cudaProfilerStop")
 
     return parser
 

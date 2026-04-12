@@ -121,8 +121,7 @@ USE_WANDB=false
 WANDB_PROJECT="qwen3-14b"
 WANDB_RUN_NAME="qwen3-14b-${MODE}"
 DETERMINISTIC=false
-BENCH_STEPS=10
-WARMUP_STEPS=20
+NUM_ITERS=10
 
 EPOCHS=1
 LR=1e-5
@@ -260,11 +259,9 @@ else
 fi
 
 # ── nsys profiling ────────────────────────────────────────────────────────────
-# Capture rounds 6 and 7 out of 10 total steps.
-# profile_start: global_step value BEFORE the 6th step's forward pass (= 5)
-# profile_end:   global_step value AFTER  the 7th step completes        (= 7)
-PROFILE_START=5
-PROFILE_END=7
+# Capture the last 2 iterations out of NUM_ITERS total (1-based).
+PROFILE_START=$((NUM_ITERS - 1))
+PROFILE_END=${NUM_ITERS}
 NSYS_OUT="${OUTPUT_DIR}/${RUN_TAG}_profile"
 
 PROFILE_FLAG=""
@@ -290,8 +287,7 @@ DEEPSPEED_CMD="${NUMARUN} deepspeed --num_gpus=${GPUS_PER_NODE} ${SCRIPT_DIR}/fi
     --log_interval ${LOG_INTERVAL} \
     --dataset_name ${DATASET_NAME} \
     --dataset_percentage ${DATASET_PERCENTAGE} \
-    --bench_steps ${BENCH_STEPS} \
-    --warmup_steps ${WARMUP_STEPS} \
+    --num_iters ${NUM_ITERS} \
     ${ACTIVATION_CHECKPOINTING_FLAG} \
     ${SAVE_CHECKPOINT_ARG} \
     ${WANDB_FLAG} \
