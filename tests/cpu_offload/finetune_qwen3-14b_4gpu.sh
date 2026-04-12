@@ -15,12 +15,12 @@ PROFILE=false
 
 usage() {
     echo "Usage: $0 [--mode MODE] [--gbs N] [--mbs N] [--cpu_ratio R] [--profile]"
-    echo "  --mode       superoffload (default) | zerooffload | zeroinfinity | superinfinity"
+    echo "  --mode       superoffload (default) | zerooffload | zeroinfinity-zerooffload | zeroinfinity-superoffload"
     echo "  --gbs train batch size across all GPUs (default: 8)"
     echo "  --mbs        train micro batch size per GPU (default: 1)"
     echo "               gradient_accumulation_steps is derived as:"
     echo "               gbs / (mbs * num_gpus)"
-    echo "  --cpu_ratio  CPU offload ratio for superoffload/superinfinity (default: 0.90)"
+    echo "  --cpu_ratio  CPU offload ratio for superoffload/zeroinfinity-superoffload (default: 0.90)"
     echo "  --profile    enable nsys profiling (default: off)"
     exit 1
 }
@@ -58,14 +58,14 @@ if [ "$MODE" = "superoffload" ]; then
 elif [ "$MODE" = "zerooffload" ]; then
     MODE_LABEL="zero-offload"
     CONFIG_LABEL="bs${GBS}-mbs${MBS}"
-elif [ "$MODE" = "zeroinfinity" ]; then
-    MODE_LABEL="zero-infinity"
+elif [ "$MODE" = "zeroinfinity-zerooffload" ]; then
+    MODE_LABEL="zeroinfinity-zerooffload"
     CONFIG_LABEL="bs${GBS}-mbs${MBS}"
-elif [ "$MODE" = "superinfinity" ]; then
-    MODE_LABEL="super-infinity"
+elif [ "$MODE" = "zeroinfinity-superoffload" ]; then
+    MODE_LABEL="zeroinfinity-superoffload"
     CONFIG_LABEL="bs${GBS}-mbs${MBS}-cpu${CPU_RATIO}"
 else
-    echo "Error: Unknown mode '$MODE'. Use: superoffload | zerooffload | zeroinfinity | superinfinity"
+    echo "Error: Unknown mode '$MODE'. Use: superoffload | zerooffload | zeroinfinity-zerooffload | zeroinfinity-superoffload"
     exit 1
 fi
 
@@ -195,7 +195,7 @@ cat > "${DS_CONFIG_JSON}" << EOF
 }
 EOF
 
-elif [ "$MODE" = "zeroinfinity" ]; then
+elif [ "$MODE" = "zeroinfinity-zerooffload" ]; then
 cat > "${DS_CONFIG_JSON}" << EOF
 {
     "train_batch_size": ${GBS},
@@ -220,7 +220,7 @@ cat > "${DS_CONFIG_JSON}" << EOF
 }
 EOF
 
-elif [ "$MODE" = "superinfinity" ]; then
+elif [ "$MODE" = "zeroinfinity-superoffload" ]; then
 cat > "${DS_CONFIG_JSON}" << EOF
 {
     "train_batch_size": ${GBS},
