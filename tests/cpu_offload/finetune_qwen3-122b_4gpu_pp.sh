@@ -54,7 +54,7 @@ CMD="${NUMARUN} deepspeed --num_gpus=${GPUS} ${SCRIPT_DIR}/finetune_pp.py \
     --pp_stages ${PP_STAGES} \
     --gpus_per_node ${GPUS} \
     --output_dir ${OUTPUT_DIR} \
-    --config_label ${CONFIG_LABEL} \
+    --run_tag ${CONFIG_LABEL} \
     --max_length 4096 \
     --weight_decay 0.01 \
     --seed 42 \

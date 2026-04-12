@@ -14,12 +14,11 @@ Usage:
 """
 
 import argparse
-import ctypes
 import json
 import os
 import time
 import logging
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -39,23 +38,16 @@ ALPACA_INSTRUCTION_TEMPLATE = "### Instruction:\n{instruction}\n\n"
 ALPACA_INPUT_TEMPLATE = "### Input:\n{input}\n\n"
 ALPACA_RESPONSE_TEMPLATE = "### Response:\n{output}"
 
+
 # ── nsys helper ───────────────────────────────────────────────────────────────
-try:
-    _libcudart = ctypes.CDLL("libcudart.so")
-    _NSYS_AVAILABLE = True
-except OSError:
-    _libcudart = None
-    _NSYS_AVAILABLE = False
-
-
 def nsys_start():
-    if _NSYS_AVAILABLE:
-        _libcudart.cudaProfilerStart()
+    if torch.cuda.is_available():  #ignore-cuda
+        torch.cuda.cudart().cudaProfilerStart()  #ignore-cuda
 
 
 def nsys_stop():
-    if _NSYS_AVAILABLE:
-        _libcudart.cudaProfilerStop()
+    if torch.cuda.is_available():  #ignore-cuda
+        torch.cuda.cudart().cudaProfilerStop()  #ignore-cuda
 
 
 # ── Logger ────────────────────────────────────────────────────────────────────
@@ -76,6 +68,44 @@ def setup_logger(rank: int = 0, log_level: str = "INFO") -> logging.Logger:
         logger.addHandler(handler)
 
     return logger
+
+
+# ── Per-iteration training log ────────────────────────────────────────────────
+class TrainingLogWriter:
+    """Per-iteration training log writer (rank-0 only).
+
+    Streams one JSON record per iteration to ``{run_tag}_training_log.jsonl``
+    during training and, on ``close_and_convert``, rewrites the collected
+    records into ``{run_tag}_training_log.json`` as a single JSON array.
+    """
+
+    def __init__(self, output_dir: str, run_tag: str = "run") -> None:
+        os.makedirs(output_dir, exist_ok=True)
+        self.run_tag = run_tag
+        self.jsonl_path = os.path.join(output_dir, f"{run_tag}_training_log.jsonl")
+        self.json_path = os.path.join(output_dir, f"{run_tag}_training_log.json")
+        self._f = open(self.jsonl_path, "w")
+        self._closed = False
+
+    def append(self, record: Dict[str, Any]) -> None:
+        self._f.write(json.dumps(record) + "\n")
+        self._f.flush()
+
+    def close_and_convert(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._f.close()
+
+        records = []
+        with open(self.jsonl_path, "r") as fin:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+        with open(self.json_path, "w") as fout:
+            json.dump(records, fout, indent=2)
 
 
 # ── Pipeline Layer Wrappers ───────────────────────────────────────────────────
@@ -329,52 +359,98 @@ def main(args: argparse.Namespace) -> None:
     # PP pipeline bubble fraction: (stages-1) / (stages + micro_batches - 1)
     bubble_fraction = (args.pp_stages - 1) / (args.pp_stages + args.micro_batches - 1)
 
-    # nsys capture: bench steps 7-8 (global steps warmup+7 and warmup+8)
-    nsys_start_step = args.warmup_steps + args.bench_steps - 2
-    nsys_stop_step = args.warmup_steps + args.bench_steps
-
+    # ── Training loop ────────────────────────────────────────────────────────
+    global_step = 0
     iter_times = []
     tflops_per_step = []
     losses = []
+    step_records = []
+
+    training_log_writer: Optional[TrainingLogWriter] = None
+    if dist.get_rank() == 0:
+        training_log_writer = TrainingLogWriter(args.output_dir, run_tag=args.run_tag)
+
     engine.train()
+    total_steps = args.warmup_steps + args.bench_steps
 
-    for step in range(args.warmup_steps + args.bench_steps):
-        if step == nsys_start_step:
-            nsys_start()
+    try:
+        for step in range(total_steps):
+            if args.profile and step == args.profile_start:
+                nsys_start()
 
-        t0 = time.time()
-        loss = engine.train_batch()
-        step_time = time.time() - t0
+            t0 = time.time()
+            loss = engine.train_batch()
+            step_time = time.time() - t0
+            global_step += 1
 
-        if step >= args.warmup_steps:
-            iter_times.append(step_time)
+            if global_step > args.warmup_steps:
+                iter_times.append(step_time)
 
-        loss_val = loss.item() if loss is not None else float("nan")
-        losses.append(loss_val)
+            loss_val = loss.item() if loss is not None else float("nan")
+            losses.append(loss_val)
 
-        tokens_per_second = args.batch_size * args.max_length / step_time
-        step_tflops_per_gpu = None
+            tokens_per_second = args.batch_size * args.max_length / step_time
+            step_tflops_per_gpu = None
 
-        if per_sample_tflops is not None:
-            step_tflops_per_gpu = (
-                args.batch_size * per_sample_tflops / step_time / args.gpus_per_node
-            )
-            if step >= args.warmup_steps:
-                tflops_per_step.append(round(step_tflops_per_gpu, 2))
+            if per_sample_tflops is not None:
+                step_tflops_per_gpu = (
+                    args.batch_size * per_sample_tflops / step_time / args.gpus_per_node
+                )
+                if global_step > args.warmup_steps:
+                    tflops_per_step.append(round(step_tflops_per_gpu, 2))
 
-        if (step + 1) % args.log_interval == 0 and dist.get_rank() == 0:
-            tflops_str = (
-                f"TFLOPS/GPU: {step_tflops_per_gpu:5.2f} | " if step_tflops_per_gpu else ""
-            )
-            logger.info(
-                f"Step {step+1:4d} | Loss: {loss_val:.4f} | "
-                f"Time: {step_time * MS_PER_SECOND:5.0f}ms | "
-                f"{tflops_str}Tokens/s: {tokens_per_second:6.0f}"
-            )
+            if global_step % args.log_interval == 0 and dist.get_rank() == 0:
+                if is_moe:
+                    log_msg = (f"Step {global_step:4d} | "
+                               f"Loss: {loss_val:.4f} | "
+                               f"Time: {step_time * MS_PER_SECOND:5.0f}ms")
+                else:
+                    tflops_str = (
+                        f"TFLOPS/GPU: {step_tflops_per_gpu:5.2f} | " if step_tflops_per_gpu else ""
+                    )
+                    log_msg = (f"Step {global_step:4d} | "
+                               f"Loss: {loss_val:.4f} | "
+                               f"Time: {step_time * MS_PER_SECOND:5.0f}ms | "
+                               f"{tflops_str}Tokens/s: {tokens_per_second:6.0f}")
+                logger.info(log_msg)
 
-        if step == nsys_stop_step - 1:
-            nsys_stop()
+            # Accumulate per-step record for results JSON (bench steps only).
+            if global_step > args.warmup_steps:
+                record = {
+                    "step": global_step,
+                    "loss": round(loss_val, 6),
+                    "iter_time_ms": round(step_time * MS_PER_SECOND, 1),
+                    "tokens_per_second": round(tokens_per_second, 1),
+                }
+                if step_tflops_per_gpu is not None:
+                    record["tflops_per_gpu"] = round(step_tflops_per_gpu, 4)
+                step_records.append(record)
 
+            # Full per-iteration training log (includes warmup steps).
+            if training_log_writer is not None:
+                iter_record = {
+                    "global_step": global_step,
+                    "loss": round(loss_val, 6),
+                    "step_time_ms": round(step_time * MS_PER_SECOND, 1),
+                    "tokens_per_second": (
+                        round(tokens_per_second, 1) if not is_moe else None
+                    ),
+                    "learning_rate": args.lr,
+                    "tflops_per_gpu": (
+                        round(step_tflops_per_gpu, 4) if step_tflops_per_gpu is not None else None
+                    ),
+                }
+                training_log_writer.append(iter_record)
+
+            if args.profile and global_step == args.profile_end:
+                nsys_stop()
+
+    finally:
+        if training_log_writer is not None:
+            training_log_writer.close_and_convert()
+            logger.info(f"Training log saved to {training_log_writer.json_path}")
+
+    # ── Summary & results.json ───────────────────────────────────────────────
     if dist.get_rank() == 0 and iter_times:
         avg_time = sum(iter_times) / len(iter_times)
         avg_tflops_per_gpu = (
@@ -387,7 +463,7 @@ def main(args: argparse.Namespace) -> None:
         results = {
             "mode": "pp",
             "model": args.model_name,
-            "config_label": args.config_label,
+            "config_label": args.run_tag,
             "pp_stages": args.pp_stages,
             "micro_batches": args.micro_batches,
             "batch_size": args.batch_size,
@@ -401,10 +477,11 @@ def main(args: argparse.Namespace) -> None:
             "pipeline_bubble_fraction": round(bubble_fraction, 3),
             "warmup_steps": args.warmup_steps,
             "bench_steps": args.bench_steps,
+            "steps": step_records,
         }
 
         os.makedirs(args.output_dir, exist_ok=True)
-        results_path = os.path.join(args.output_dir, "results.json")
+        results_path = os.path.join(args.output_dir, f"{args.run_tag}_results.json")
         with open(results_path, "w") as f:
             json.dump(results, f, indent=2)
 
@@ -427,10 +504,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--batch_size", type=int, required=True,
-                        help="Global batch size = micro_batch_size × micro_batches")
+                        help="Global batch size = micro_batch_size * micro_batches")
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--config_label", type=str, default="",
-                        help="Human-readable config label stored in results.json")
+    parser.add_argument("--run_tag", type=str, default="run",
+                        help="Tag embedded in output filenames "
+                             "(e.g. qwen3-14b_pp_pp-mbs1-gbs256). "
+                             "Defaults to 'run' when not provided.")
 
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2",
                         choices=["eager", "sdpa", "flash_attention_2"])
@@ -455,6 +534,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset_name", type=str, default="tatsu-lab/alpaca")
     parser.add_argument("--dataset_percentage", type=float, default=10.0)
 
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable nsys profiling via cudaProfilerApi range capture")
+    parser.add_argument("--profile_start", type=int, default=0,
+                        help="Global step at which to call cudaProfilerStart")
+    parser.add_argument("--profile_end", type=int, default=0,
+                        help="Global step at which to call cudaProfilerStop")
+
     parser.add_argument("--local_rank", type=int, default=-1)
     return parser
 
@@ -467,7 +553,7 @@ if __name__ == "__main__":
     if args.batch_size != args.micro_batch_size * args.micro_batches:
         raise ValueError(
             f"batch_size ({args.batch_size}) must equal "
-            f"micro_batch_size ({args.micro_batch_size}) × micro_batches ({args.micro_batches})"
+            f"micro_batch_size ({args.micro_batch_size}) * micro_batches ({args.micro_batches})"
         )
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
